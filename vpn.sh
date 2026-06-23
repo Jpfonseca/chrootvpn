@@ -45,6 +45,7 @@ VERSION="v1.96"
 CONFFILE="/opt/etc/vpn.conf"
 
 # if vpn.conf present, source VPN, VPNIP, SPLIT and SSLVPN from it
+# shellcheck disable=SC1090
 [[ -f "${CONFFILE}" ]] && . "${CONFFILE}"
 
 # Sane defaults:
@@ -2196,8 +2197,6 @@ installPackages()
 # fixes DNS RedHat family if systemd-resolved not active
 fixRHDNS()
 {
-   local counter
-
    # if RedHat and systemd-resolvd not active
    if [[ "${RH}" -eq 1 ]] && [[ ! -f "/run/systemd/resolve/stub-resolv.conf" ]] && command -v systemctl &> /dev/null
    then
@@ -2855,4 +2854,3 @@ main()
 
 # main stub will full arguments passing
 main "$@"
-
