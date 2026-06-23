@@ -116,6 +116,7 @@ vpn.sh -v|--version
 |           |-l|gets snx/cshell_install.sh from cwd directory, if present|
 |           |  |the files wont be loaded from the remote CheckPoint      |
 |--portalurl|  |custom prefix path other than / and sslvpn               |
+|--backend  |  |isolation backend: `chroot` (default) or `nspawn`        |
 
 
 |Command      |Function                                               |
@@ -154,6 +155,36 @@ This script can be downloaded running:
 - git clone https://github.com/ruyrybeyro/chrootvpn/blob/main/vpn.sh
 - wget https://raw.githubusercontent.com/ruyrybeyro/chrootvpn/main/vpn.sh
 - curl https://raw.githubusercontent.com/ruyrybeyro/chrootvpn/main/vpn.sh -O
+
+ISOLATION BACKENDS
+==================
+
+By default the script uses a traditional **chroot** to provide the 32-bit Debian environment needed by SNX and CShell. An optional **systemd-nspawn** backend is also available for systems that prefer namespace-based isolation.
+
+| Backend  | How to select              | Requirements                    | Notes                              |
+|----------|----------------------------|---------------------------------|------------------------------------|
+| `chroot` | *(default)*                | `setarch` / coreutils           | Most compatible, works everywhere  |
+| `nspawn` | `--backend=nspawn`         | `systemd-nspawn` (systemd ≥239) | Better namespace isolation         |
+
+Select a backend at install time or when running any command:
+
+    vpn.sh --backend=nspawn -i --vpn=vpn.example.com
+    vpn.sh --backend=nspawn start
+
+The selected backend is saved in `/opt/etc/vpn.conf` as `ISOLATION_BACKEND` so subsequent invocations of the script use the same backend automatically.
+
+> **Note:** The `chroot` backend remains the default and the recommended option for the widest distribution compatibility. The `nspawn` backend requires `systemd-nspawn` (usually in the `systemd-container` package) and a systemd-based host.
+
+PERFORMANCE IMPROVEMENTS
+=========================
+
+The following optimizations have been applied to the script:
+
+- **/etc/os-release parsed once** – a single pass with a `while read` loop replaces four separate `awk` sub-processes when detecting the host distribution.
+- **Mount list cached** – `umountChrootFS` captures the output of `mount | grep` once and iterates over the cached result instead of running the command multiple times.
+- **Firefox directory search cached** – the `find` command that locates Firefox policy directories is run at most once per `FirefoxPolicy` invocation; the result is stored in `FIREFOX_DIRS_CACHE`.
+- **Polling loops use exponential backoff** – the `waitForService` helper replaces hard-coded `sleep 2 / counter` loops in `fixRHDNS`. Sleep time starts at 1 s and doubles each iteration (capped at 8 s), reducing average wait time.
+- **Parallel APT downloads** – `installDebian` writes an `/etc/apt/apt.conf.d/99parallel` snippet that enables concurrent package downloads, reducing installation time on multi-host mirrors.
 
 KNOWN FEATURES
 ==============

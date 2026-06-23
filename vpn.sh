@@ -60,6 +60,12 @@ CONFFILE="/opt/etc/vpn.conf"
 # default chroot location (700 MB needed - 1.5GB while installing)
 [[ -z "$CHROOT" ]] && CHROOT="/opt/chroot"
 
+# isolation backend: chroot (default) or nspawn (systemd-nspawn)
+[[ -z "$ISOLATION_BACKEND" ]] && ISOLATION_BACKEND="chroot"
+
+# cache for Firefox policy directory search (populated on first FirefoxPolicy call)
+FIREFOX_DIRS_CACHE=""
+
 # split VPN routing table if deleting VPN gateway is not enough
 # selfupdate brings it from the older version
 # if empty script will delete VPN gateway
@@ -194,6 +200,12 @@ do_help()
                      use it as --portalurl=STRING together with --install
 	-o|--output  redirects ALL output for FILE
 	-s|--silent  special case of output, no arguments
+	--backend    isolation backend: chroot (default) or nspawn (systemd-nspawn)
+	             example: --backend=nspawn
+	
+	ISOLATION BACKENDS:
+	  chroot     Traditional chroot (default, most compatible)
+	  nspawn     systemd-nspawn (better isolation, requires systemd)
 	
 	start        starts    CShell daemon
 	stop         stops     CShell daemon
@@ -375,6 +387,9 @@ doGetOpts()
          l)                LOCALINSTALL=true ;;      # if cwd snx/cshell_install.sh, uses it
          sudoers)          doSudoers 
                            exit 0 ;;
+         backend )         needs_arg                 # isolation backend selection
+                           ISOLATION_BACKEND="${OPTARG}"
+                           [[ "${ISOLATION_BACKEND}" == "chroot" ]] || [[ "${ISOLATION_BACKEND}" == "nspawn" ]] || die "Unknown backend: ${ISOLATION_BACKEND}. Use chroot or nspawn" ;;
          ??* )             die "Illegal option --${OPT}" ;;  # bad long option
          ? )               exit 2;;                  # bad short option (reported by getopts) 
 
@@ -414,17 +429,33 @@ getDistro()
 
    # init variables for later use
 
-   # $ID
-   [[ -f "/etc/os-release" ]] && ID="$(awk -F= ' /^ID=/ { gsub("\"", ""); print $2 } ' /etc/os-release)"
-   [[ -z "${ID}" ]] && ID="none"
-
-   # $ID_LIKE
-   [[ -f "/etc/os-release" ]] && ID_LIKE="$(awk -F= ' /^ID_LIKE=/ { gsub("\"", ""); print $2 } ' /etc/os-release)"
-   [[ -z "${ID_LIKE}" ]] && ID_LIKE="none"
-
-   # $DISTRIB
-   [[ -f "/etc/os-release" ]] && DISTRIB="$(awk -F= ' /^DISTRIB/ { gsub("\"", ""); print $2 } ' /etc/os-release)"
-   [[ -z "${DISTRIB}" ]] && DISTRIB="none"
+   # parse /etc/os-release once using a single read pass
+   if [[ -f "/etc/os-release" ]]; then
+      declare -A _OS_INFO
+      while IFS='=' read -r _key _value; do
+         # skip blank lines and comment lines
+         [[ -z "$_key" || "$_key" == '#'* ]] && continue
+         _OS_INFO["$_key"]="${_value//\"/}"
+      done < /etc/os-release
+      ID="${_OS_INFO[ID]:-none}"
+      ID_LIKE="${_OS_INFO[ID_LIKE]:-none}"
+      # Look for any DISTRIB* key (lsb-release style), preferring DISTRIB_ID
+      # Matches original awk /^DISTRIB/ behaviour (first value of any DISTRIB* key)
+      DISTRIB="${_OS_INFO[DISTRIB_ID]:-none}"
+      if [[ "$DISTRIB" == "none" ]]; then
+         for _k in "${!_OS_INFO[@]}"; do
+            if [[ "$_k" == DISTRIB* ]]; then
+               DISTRIB="${_OS_INFO[$_k]}"
+               break
+            fi
+         done
+      fi
+      unset _OS_INFO _key _value _k
+   else
+      ID="none"
+      ID_LIKE="none"
+      DISTRIB="none"
+   fi
 
    # $SystemName
    [[ -f "/etc/os-version" ]] && SystemName="$(awk -F= '/SystemName=/ { gsub("\"", ""); print $2 } ' /etc/os-version)"
@@ -595,6 +626,55 @@ doChroot()
 }
 
 
+# systemd-nspawn backend wrapper
+doNspawn()
+{
+   command -v systemd-nspawn &>/dev/null || die "systemd-nspawn not available. Install the systemd container package for your distribution (e.g. systemd-container on Debian/Ubuntu; on Arch Linux it is part of the systemd package)"
+   systemd-nspawn \
+      --quiet \
+      --directory="${CHROOT}" \
+      --bind=/tmp/.X11-unix \
+      --bind=/dev/net/tun \
+      --setenv=DISPLAY="${DISPLAY}" \
+      "$@"
+}
+
+
+# unified isolation wrapper - uses ISOLATION_BACKEND to select backend
+doIsolate()
+{
+   case "$ISOLATION_BACKEND" in
+      nspawn)
+         doNspawn "$@"
+         ;;
+      chroot|*)
+         doChroot "$@"
+         ;;
+   esac
+}
+
+
+# wait for a systemd service to become active with exponential backoff
+# $1 = service name
+# $2 = max wait seconds (default 60)
+waitForService()
+{
+   local service="$1"
+   local max_wait="${2:-60}"
+   local waited=0
+   local sleep_time=1
+
+   while ! systemctl is-active "$service" &>/dev/null
+   do
+      sleep "$sleep_time"
+      (( waited += sleep_time ))
+      (( sleep_time = sleep_time < 8 ? sleep_time * 2 : 8 ))
+      (( waited >= max_wait )) && return 1
+   done
+   return 0
+}
+
+
 # C/Unix convention - 0 success, 1 failure
 isCShellRunning()
 {
@@ -667,25 +747,29 @@ umountChrootFS()
 {
    # unmounts chroot filesystems
    # if mounted
-   if mount | grep "${CHROOT}" &> /dev/null
+   local CHROOT_MOUNTS
+   CHROOT_MOUNTS=$(mount | grep "${CHROOT}" | awk '{ print $3 }')
+   if [[ -n "$CHROOT_MOUNTS" ]]
    then
 
       # there is no --fstab for umount
       # we dont want to abort if not present
       [[ -f "${CHROOT}/etc/fstab" ]] && doChroot /usr/bin/umount -a 2> /dev/null
          
-      # umounts any leftover mount
-      for i in $(mount | grep "${CHROOT}" | awk ' { print  $3 } ' )
+      # umounts any leftover mount (cache once, reuse)
+      while IFS= read -r i
       do
-         umount "$i" 2> /dev/null
-         umount -l "$i" 2> /dev/null
-      done
+         umount "$i" 2> /dev/null || umount -l "$i" 2> /dev/null
+      done <<< "$CHROOT_MOUNTS"
 
-      # force umounts any leftover mount
-      for i in $(mount | grep "${CHROOT}" | awk ' { print  $3 } ' )
-      do
-         umount -l "$i" 2> /dev/null
-      done
+      # force umounts any still-remaining mounts
+      CHROOT_MOUNTS=$(mount | grep "${CHROOT}" | awk '{ print $3 }')
+      if [[ -n "$CHROOT_MOUNTS" ]]; then
+         while IFS= read -r i
+         do
+            umount -l "$i" 2> /dev/null
+         done <<< "$CHROOT_MOUNTS"
+      fi
    fi
 }
 
@@ -747,9 +831,16 @@ FirefoxPolicy()
 
    fi
 
+   # cache the find result once per script execution to avoid repeated find calls;
+   # this is intentional: the Firefox install layout does not change within a single run
+   if [[ -z "$FIREFOX_DIRS_CACHE" ]]; then
+      FIREFOX_DIRS_CACHE=$(find /usr/lib/*firefox*/distribution /usr/lib64/*firefox*/distribution /usr/share/*firefox*/distribution /opt/*firefox*/distribution /opt/moz/*firefox*/distribution /usr/lib64/*mozilla* -type d -maxdepth 0 2> /dev/null)
+   fi
+
    # if Firefox installed
    # cycle possible firefox global directories
-   for DIR in "/etc/firefox/policies" $(find /usr/lib/*firefox*/distribution /usr/lib64/*firefox*/distribution /usr/share/*firefox*/distribution /opt/*firefox*/distribution /opt/moz/*firefox*/distribution /usr/lib64/*mozilla* -type d -maxdepth 0 2> /dev/null)
+   # shellcheck disable=SC2086  # word splitting is intentional: same behaviour as original $(find ...)
+   for DIR in "/etc/firefox/policies" ${FIREFOX_DIRS_CACHE}
    do
       # -d ${DIR} double check, mostly redundant check
       if  [[ "$1" == "install" ]] && [[ -d "${DIR}" ]]
@@ -912,19 +1003,19 @@ showStatus()
    uname -r
 
    echo -n "Chroot: "
-   doChroot /bin/bash --login -pf <<-EOF2 | awk -v ORS= -F"=" '/^PRETTY_NAME/ { gsub("\"","");print $2" " } '
+   doIsolate /bin/bash --login -pf <<-EOF2 | awk -v ORS= -F"=" '/^PRETTY_NAME/ { gsub("\"","");print $2" " } '
 	cat /etc/os-release
 	EOF2
 
    # print--architecture and not uname because chroot shares the same kernel
-   doChroot /bin/bash --login -pf <<-EOF3
+   doIsolate /bin/bash --login -pf <<-EOF3
 	/usr/bin/dpkg --print-architecture
 	EOF3
 
    # SNX version
    echo
    echo -n "SNX - installed              "
-   doChroot snx -v 2> /dev/null | awk '/build/ { print $2 }'
+   doIsolate snx -v 2> /dev/null | awk '/build/ { print $2 }'
    
    echo -n "SNX - available for download "
    # shellcheck disable=SC2086
@@ -1209,7 +1300,7 @@ doStart()
    rm -f "${CHROOT}/tmp/cshell.fifo" &> /dev/null
 
    # launches CShell inside chroot
-   doChroot /bin/bash --login -pf <<-EOF4
+   doIsolate /bin/bash --login -pf <<-EOF4
 	su -c "DISPLAY=${DISPLAY} /usr/bin/cshell/launcher" ${CSHELL_USER}
 	EOF4
 
@@ -1244,7 +1335,7 @@ fixDNS2()
 doDisconnect()
 {
    # if snx/VPN up, disconnects
-   pgrep snx > /dev/null && doChroot /usr/bin/snx -d
+   pgrep snx > /dev/null && doIsolate /usr/bin/snx -d
 
    # try to fix resolv.conf having VPN DNS servers 
    # after tearing down VPN connection
@@ -1275,7 +1366,7 @@ doShell()
 
    # opens an interactive root command line shell 
    # inside the chrooted environment
-   doChroot /bin/bash --login -pf
+   doIsolate /bin/bash --login -pf
 
    # dont need mounted filesystems with CShell agent down
    if ! isCShellRunning
@@ -1330,7 +1421,7 @@ doUninstall()
 # vpn.sh upgrade option
 Upgrade() 
 {
-   doChroot /bin/bash --login -pf <<-EOF12
+   doIsolate /bin/bash --login -pf <<-EOF12
 	apt update
 	apt -y upgrade
         apt -y autoremove
@@ -1698,6 +1789,12 @@ InstallDebootstrapDeb()
 installDebian()
 {
    echo "Debian family setup" >&2
+
+   # enable parallel downloads for faster installation
+   cat >> /etc/apt/apt.conf.d/99parallel <<-APTEOF
+	APT::Acquire::Queue-Mode "host";
+	APT::Acquire::Retries "3";
+	APTEOF
 
    # updates metadata
    apt -y update
@@ -2121,13 +2218,7 @@ fixRHDNS()
       systemctl enable systemd-resolved
 
       # Possibly waiting for systemd service to be active
-      counter=0
-      while ! systemctl is-active systemd-resolved &> /dev/null
-      do
-         sleep 2
-         (( counter=counter+1 ))
-         [[ "$counter" -eq 30 ]] && die "systemd-resolved not going live"
-      done
+      waitForService systemd-resolved 60 || die "systemd-resolved not going live"
 
       [[ ! -f "/run/systemd/resolve/stub-resolv.conf" ]] && die "Something went wrong activating systemd-resolved"
 
@@ -2145,13 +2236,7 @@ fixRHDNS()
       systemctl reload NetworkManager
 
       # waits for it to be up
-      counter=0
-      while ! systemctl is-active NetworkManager &> /dev/null
-      do 
-         sleep 4
-         (( counter=counter+1 ))
-         [[ "$counter" -eq 20 ]] && die "NetworkManager not going live"
-      done
+      waitForService NetworkManager 80 || die "NetworkManager not going live"
    fi
 }
 
@@ -2653,6 +2738,7 @@ createConfFile()
 	VPNIP="${VPNIP}"
 	SPLIT="${SPLIT}"
 	CHROOT="${CHROOT}"
+	ISOLATION_BACKEND="${ISOLATION_BACKEND}"
 	EOF13
 
     # if not default, save it
@@ -2670,7 +2756,7 @@ chrootEnd()
    local ROOTHOME
 
    # do the last leg of setup inside chroot
-   doChroot /bin/bash --login -pf <<-EOF15
+   doIsolate /bin/bash --login -pf <<-EOF15
 	/root/chroot_setup.sh
 	EOF15
 
