@@ -63,6 +63,9 @@ CONFFILE="/opt/etc/vpn.conf"
 # isolation backend: chroot (default) or nspawn (systemd-nspawn)
 [[ -z "$ISOLATION_BACKEND" ]] && ISOLATION_BACKEND="chroot"
 
+# cache for Firefox policy directory search (populated on first FirefoxPolicy call)
+FIREFOX_DIRS_CACHE=""
+
 # split VPN routing table if deleting VPN gateway is not enough
 # selfupdate brings it from the older version
 # if empty script will delete VPN gateway
@@ -431,7 +434,7 @@ getDistro()
       declare -A _OS_INFO
       while IFS='=' read -r _key _value; do
          # skip blank lines and comment lines
-         [[ -z "$_key" || "$_key" =~ ^# ]] && continue
+         [[ -z "$_key" || "$_key" == '#'* ]] && continue
          _OS_INFO["$_key"]="${_value//\"/}"
       done < /etc/os-release
       ID="${_OS_INFO[ID]:-none}"
@@ -626,7 +629,7 @@ doChroot()
 # systemd-nspawn backend wrapper
 doNspawn()
 {
-   command -v systemd-nspawn &>/dev/null || die "systemd-nspawn not available. Install the systemd container package for your distribution (e.g. systemd-container on Debian/Ubuntu, systemd-nspawn on Arch)"
+   command -v systemd-nspawn &>/dev/null || die "systemd-nspawn not available. Install the systemd container package for your distribution (e.g. systemd-container on Debian/Ubuntu; on Arch Linux it is part of the systemd package)"
    systemd-nspawn \
       --quiet \
       --directory="${CHROOT}" \
@@ -836,6 +839,7 @@ FirefoxPolicy()
 
    # if Firefox installed
    # cycle possible firefox global directories
+   # shellcheck disable=SC2086  # word splitting is intentional: same behaviour as original $(find ...)
    for DIR in "/etc/firefox/policies" ${FIREFOX_DIRS_CACHE}
    do
       # -d ${DIR} double check, mostly redundant check
