@@ -178,7 +178,7 @@ The selected backend is saved in `/opt/etc/vpn.conf` as `ISOLATION_BACKEND` so s
 PERFORMANCE IMPROVEMENTS
 =========================
 
-The following optimisations have been applied to the script:
+The following optimizations have been applied to the script:
 
 - **/etc/os-release parsed once** – a single pass with a `while read` loop replaces four separate `awk` sub-processes when detecting the host distribution.
 - **Mount list cached** – `umountChrootFS` captures the output of `mount | grep` once and iterates over the cached result instead of running the command multiple times.

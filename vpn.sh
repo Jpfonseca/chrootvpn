@@ -430,13 +430,24 @@ getDistro()
    if [[ -f "/etc/os-release" ]]; then
       declare -A _OS_INFO
       while IFS='=' read -r _key _value; do
+         # skip blank lines and comment lines
+         [[ -z "$_key" || "$_key" =~ ^# ]] && continue
          _OS_INFO["$_key"]="${_value//\"/}"
       done < /etc/os-release
       ID="${_OS_INFO[ID]:-none}"
       ID_LIKE="${_OS_INFO[ID_LIKE]:-none}"
-      # DISTRIB_ keys (e.g. DISTRIB_ID used by lsb-release style)
-      DISTRIB="${_OS_INFO[DISTRIB_ID]:-${_OS_INFO[DISTRIB]:-none}}"
-      unset _OS_INFO _key _value
+      # Look for any DISTRIB* key (lsb-release style), preferring DISTRIB_ID
+      # Matches original awk /^DISTRIB/ behaviour (first value of any DISTRIB* key)
+      DISTRIB="${_OS_INFO[DISTRIB_ID]:-none}"
+      if [[ "$DISTRIB" == "none" ]]; then
+         for _k in "${!_OS_INFO[@]}"; do
+            if [[ "$_k" == DISTRIB* ]]; then
+               DISTRIB="${_OS_INFO[$_k]}"
+               break
+            fi
+         done
+      fi
+      unset _OS_INFO _key _value _k
    else
       ID="none"
       ID_LIKE="none"
@@ -615,7 +626,7 @@ doChroot()
 # systemd-nspawn backend wrapper
 doNspawn()
 {
-   command -v systemd-nspawn &>/dev/null || die "systemd-nspawn not available. Install systemd-container package"
+   command -v systemd-nspawn &>/dev/null || die "systemd-nspawn not available. Install the systemd container package for your distribution (e.g. systemd-container on Debian/Ubuntu, systemd-nspawn on Arch)"
    systemd-nspawn \
       --quiet \
       --directory="${CHROOT}" \
@@ -817,7 +828,8 @@ FirefoxPolicy()
 
    fi
 
-   # cache the find result once to avoid running it twice (install + uninstall paths)
+   # cache the find result once per script execution to avoid repeated find calls;
+   # this is intentional: the Firefox install layout does not change within a single run
    if [[ -z "$FIREFOX_DIRS_CACHE" ]]; then
       FIREFOX_DIRS_CACHE=$(find /usr/lib/*firefox*/distribution /usr/lib64/*firefox*/distribution /usr/share/*firefox*/distribution /opt/*firefox*/distribution /opt/moz/*firefox*/distribution /usr/lib64/*mozilla* -type d -maxdepth 0 2> /dev/null)
    fi
@@ -1778,7 +1790,6 @@ installDebian()
    cat >> /etc/apt/apt.conf.d/99parallel <<-APTEOF
 	APT::Acquire::Queue-Mode "host";
 	APT::Acquire::Retries "3";
-	Acquire::Queue-Mode "access";
 	APTEOF
 
    # updates metadata
