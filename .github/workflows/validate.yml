@@ -1,0 +1,63 @@
+name: Shell Script Validation
+
+on:
+  push:
+    branches: [ main, master, develop ]
+  pull_request:
+    branches: [ main, master, develop ]
+  workflow_dispatch:
+
+jobs:
+  validate:
+    name: Validate Shell Scripts
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install ShellCheck
+        run: sudo apt-get update && sudo apt-get install -y shellcheck
+
+      - name: Run ShellCheck
+        run: |
+          echo "Running ShellCheck on all shell scripts..."
+          find . -type f -name "*.sh" -exec shellcheck --severity=warning {} +
+          
+      - name: Check Bash Syntax
+        run: |
+          echo "Checking bash syntax..."
+          find . -type f -name "*.sh" -exec bash -n {} \;
+          
+      - name: Check for executable permissions
+        run: |
+          echo "Checking for proper executable permissions..."
+          for file in $(find . -type f -name "*.sh"); do
+            if [ ! -x "$file" ]; then
+              echo "Warning: $file is not executable"
+            fi
+          done
+
+      - name: Security Scan with Trivy
+        uses: aquasecurity/trivy-action@master
+        with:
+          scan-type: 'fs'
+          scan-ref: '.'
+          format: 'sarif'
+          output: 'trivy-results.sarif'
+          severity: 'CRITICAL,HIGH,MEDIUM'
+
+      - name: Upload Trivy results to GitHub Security
+        uses: github/codeql-action/upload-sarif@v3
+        if: always()
+        with:
+          sarif_file: 'trivy-results.sarif'
+
+      - name: Check for hardcoded secrets
+        run: |
+          echo "Checking for potential hardcoded secrets..."
+          if grep -r -E "(password|passwd|pwd|secret|token|api_key|apikey)" --include="*.sh" .; then
+            echo "Warning: Found potential hardcoded credentials. Please review."
+          else
+            echo "No obvious hardcoded secrets found."
+          fi
